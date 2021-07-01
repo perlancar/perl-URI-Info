@@ -15,14 +15,14 @@ sub meta {
         summary => 'Extract search query from thepiratebay.org (and its mirrors) URL',
         conf => {
         },
-        site => qr/\A(
+        host => qr/\A(
                        thepiratebay\.org |
                        www\.piratebaylive\.org
                    )\z/x,
     };
 }
 
-sub get_site_info {
+sub host_get_info {
     my ($self, $stash) = @_;
     my $url = $stash->{url};
 

@@ -42,7 +42,7 @@ sub _load_plugins {
                     String::Wildcard::Bash::contains_wildcard($prefix)) {
                 my $mods = Module::List::Wildcard::list_modules(
                     "${p}$prefix", {list_modules=>1, wildcard=>1});
-                for (keys %mods) {
+                for (keys %$mods) {
                     s/\A\Q$p\E//;
                     $exclude_plugins{$_}++;
                 }
@@ -70,7 +70,7 @@ sub _load_plugins {
                 String::Wildcard::Bash::contains_wildcard($prefix)) {
             my $mods = Module::List::Wildcard::list_modules(
                 "${p}$prefix", {list_modules=>1, wildcard=>1});
-            for (keys %mods) {
+            for (keys %$mods) {
                 my $mod = $_;
                 s/\A\Q$p\E//;
                 if ($exclude_plugins{$_}) {
@@ -82,10 +82,10 @@ sub _load_plugins {
                 $self->_activate_plugin($mod, $args);
             }
         } else {
-            my ($site, $event, $prio);
+            my ($host, $event, $prio);
             $prefix =~ s/\@(\d+)?\z// and $prio = $1 if defined $1;
             $prefix =~ s/\@(\w+)\z// and $event = $1 if defined $1;
-            $prefix =~ s/\@([^@]+)?\z// and $site = $1 if defined $1;
+            $prefix =~ s/\@([^@]+)?\z// and $host = $1 if defined $1;
             my $mod = "${p}$prefix";
             my $path = Module::Path::More::module_path(module=>$mod);
             if ($path) {
@@ -95,7 +95,7 @@ sub _load_plugins {
                 }
                 (my $mod_pm = "$mod.pm") =~ s!::!/!g;
                 require $mod_pm;
-                $self->_activate_plugin($mod, $args, $site, $event, $prio);
+                $self->_activate_plugin($mod, $args, $host, $event, $prio);
             } else {
                 die "[URI::Info] plugin '$_' cannot be found";
             }
@@ -103,12 +103,78 @@ sub _load_plugins {
     }
 }
 
+sub _add_handler {
+    my ($self, $host, $event, $label, $prio, $handler) = @_;
+
+    $self->{handlers_seq} //= 0;
+    my $handlers;
+    my $filter;
+    if ($host && !ref($host)) {
+        $self->{handlers}{$host}{$event} //= [];
+        $handlers = $self->{handlers}{$host}{$event};
+    } else {
+        if ($host) {
+            if (ref $host eq 'Regexp') {
+                $filter = sub {
+                    my ($input_host) = @_;
+                    $input_host =~ $host;
+                };
+            } elsif (ref $host eq 'CODE') {
+                $filter = $host;
+            } else {
+                die "Unknown type for 'host', please use str/regex/code: $host";
+            }
+        }
+        $self->{handlers}{''}{$event} //= [];
+        $handlers = $self->{handlers}{''}{$event};
+    }
+
+    # keep sorted
+    splice @$handlers, 0, scalar(@$handlers),
+        (sort { $a->[1] <=> $b->[1] || $a->[4] <=> $b->[4] } @$handlers,
+         [$label,                  #0 = label
+          $prio,                   #1 = prio
+          $filter,                 #2 = filter
+          $handler,                #3 = handler code
+          $self->{handlers_seq}++, #4 = insert sequence, for sorting
+      ]);
+}
+
 sub _activate_plugin {
-    my ($self, $mod, $args, $wanted_site, $wanted_event, $prio) = @_;
-    $prio //= 50;
+    my ($self, $mod, $args, $wanted_host, $wanted_event, $wanted_prio) = @_;
+
+    # module must already be loaded at this point
 
     # instantiate plugin object
-    my $obj = $mod->new;
+    my $obj = $mod->new(%{$args // {}});
+    my $plugin_meta = $obj->meta;
+    my $host = $plugin_meta->{host};
+
+    # find all methods in plugin class (note that inherited methods are not
+    # supported atm) and register it as handler
+    my $symtbl = \%{$mod . "::"};
+    for my $k (keys %$symtbl) {
+        my $v = $symtbl->{$k};
+        next unless ref $v eq 'CODE' || defined *$v{CODE};
+        next unless $k =~ /^(before_|on_|after_)(.+)$/;
+
+        my $meth_meta_method = "meta_$k";
+        my $meth_meta = $self->can($meth_meta_method) ? $self->$meth_meta_method : {};
+
+        (my $event = $k) =~ s/^on_//;
+
+        $self->_add_handler(
+            $event =~ /^host_/ ? ($wanted_host // $host) : undef,
+            defined $wanted_event ? $wanted_event : $event,
+            $args->{_name} // $mod,
+            defined $wanted_prio ? $wanted_prio :
+                (defined $meth_meta->{prio} ? $meth_meta->{prio} : 50),
+            sub {
+                my $stash = shift;
+                $obj->$k($stash);
+            },
+        );
+    } # for method
 }
 
 sub _run_event {
@@ -121,13 +187,26 @@ sub _run_event {
         log_trace "[URI::Info] -> run_event(%s)", \%args;
     }
     defined $name or die "Please supply 'name'";
-    $Handlers{$name} ||= [];
 
     my $before_name = "before_$name";
-    $Handlers{$before_name} ||= [];
-
     my $after_name = "after_$name";
-    $Handlers{$after_name} ||= [];
+
+    my @host_parts;
+    my @handlers;
+    if ($self->{r}{url}) {
+        my $host = $self->{r}{url}->host;
+        @host_parts = ($host);
+        while ($host =~ s/[^.]+(\.|\z)//) { push @host_parts,$host }
+    } else {
+        @host_parts = ('');
+    }
+    for my $hp (@host_parts) {
+        next unless $self->{handlers}{$hp};
+        $self->{handlers}{$hp}{$name} //= [];
+        $self->{handlers}{$hp}{$before_name} //= [];
+        $self->{handlers}{$hp}{$after_name} //= [];
+        push @handlers, $self->{handlers}{$hp};
+    }
 
     my $req_handler                          = $args{req_handler};                          $req_handler                          = 0 unless defined $req_handler;
     my $run_all_handlers                     = $args{run_all_handlers};                     $run_all_handlers                     = 1 unless defined $run_all_handlers;
@@ -144,11 +223,11 @@ sub _run_event {
   RUN_BEFORE_EVENT_HANDLERS:
     {
         last if $name =~ /\A(after|before)_/;
-        local $r->{event} = $before_name;
+        local $self->{r}{event} = $before_name;
         my $i = 0;
         for my $rec (@{ $Handlers{$before_name} }) {
             $i++;
-            my ($label, $prio, $handler) = @$rec;
+            my ($label, $prio, $filter, $handler) = @$rec;
             log_trace "[URI::Info] [event %s] [%d/%d] -> handler %s ...",
                 $before_name, $i, scalar(@{ $Handlers{$before_name} }), $label;
             $res = $handler->($r);
@@ -338,13 +417,13 @@ Constructor. Known arguments (C<*> marks required arguments):
 
 Array of plugins (names or wildcard patterns or names+arguments) to include.
 Plugin name is module name under C<URI::Info::Plugin::> without the prefix, e.g.
-C<SearchQuery::tokopedia> with optional site name
+C<SearchQuery::tokopedia> with optional host name
 (C<SearchQuery::tokopedia@foo.com>), event name (e.g.
 C<Debug::DumpStash@@before_get_info>), and priority (e.g.
 C<Debug::DumpStash@@before_get_info@99>). Wildcard pattern is a pattern
 containing wildcard characters, e.g C<SearchQuery::toko*> or C<SearchQuery::**>
 (see L<Module::List::Wildcard> for more details on the wildcard). You cannot
-special optional site name, event name, or priority when using wildcard pattern.
+special optional host name, event name, or priority when using wildcard pattern.
 name+argument is a 2-array arrayref where the first element is plugin name or
 wildcard pattern, and the second element is hashref of arguments to instantiate
 the plugin with, e.g. C<< ['SearchQuery::tokopedia', {foo=>1, bar=>2, ...}] >>.
@@ -381,7 +460,7 @@ To customize the set of plugins to use, use the OO interface.
 Planned: URI::Info will read C<URI_INFO_PLUGINS> to include/exclude plugins,
 with this syntax:
 
- -Plugin1ToExclude,+Plugin2ToInclude,arg1,val1,...,+Plugin3ToInclude@Site@EventName@Priority,...
+ -Plugin1ToExclude,+Plugin2ToInclude,arg1,val1,...,+Plugin3ToInclude@Host@EventName@Priority,...
 
 
 =head1 SEE ALSO

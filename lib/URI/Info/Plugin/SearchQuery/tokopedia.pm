@@ -15,11 +15,11 @@ sub meta {
         summary => 'Extract search query from tokopedia.com URL',
         conf => {
         },
-        site => 'tokopedia.com',
+        host => 'tokopedia.com',
     };
 }
 
-sub get_site_info {
+sub host_get_info {
     my ($self, $stash) = @_;
     my $url = $stash->{url};
     if ($url->full_path =~ m!\A/search!) {

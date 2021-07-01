@@ -15,11 +15,11 @@ sub meta {
         summary => 'Extract search query from google URL',
         conf => {
         },
-        site => sub { $_[0] =~ /\A(www\.)?google\./ },
+        host => sub { $_[0] =~ /\A(www\.)?google\./ },
     };
 }
 
-sub get_site_info {
+sub host_get_info {
     my ($self, $stash) = @_;
     my $url = $stash->{url};
 
