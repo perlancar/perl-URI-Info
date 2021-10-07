@@ -1,12 +1,12 @@
 package URI::Info::Plugin::SearchQuery::google;
 
+use strict;
+use warnings;
+
 # AUTHORITY
 # DATE
 # DIST
 # VERSION
-
-use strict;
-use warnings;
 
 use parent 'URI::Info::PluginBase';
 
@@ -23,17 +23,18 @@ sub meta {
     };
 }
 
-sub host_get_info {
+sub get_info {
     my ($self, $stash) = @_;
     my $url = $stash->{url};
+    my $res = $stash->{res};
 
     if ($url->full_path =~ m!\A/(images|search|videosearch|news|maps|blogsearch|books|groups|scholar)!) {
-        return [200, "OK", {
-            search_type  => $1,
-            search_query => $url->query_param('q'),
-        }];
+        $res->{is_search} = 1;
+        $res->{search_source} = 'google';
+        $res->{search_type} = $1;
+        $res->{search_query} = $url->query_param('q');
     }
-    [100];
+    [200]; # 200=OK, 201=OK & skip the rest of the plugins, 500=error
 }
 
 1;

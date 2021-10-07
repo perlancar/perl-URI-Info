@@ -1,15 +1,16 @@
 package URI::Info;
 
-# AUTHORITY
-# DATE
-# DIST
-# VERSION
-
 use 5.010001;
 use strict;
 use warnings;
 use Log::ger;
 
+# AUTHORITY
+# DATE
+# DIST
+# VERSION
+
+my $p = "URI::Info::Plugin::";
 sub new {
     my ($class, %args) = @_;
 
@@ -17,14 +18,49 @@ sub new {
         die "Unknown argument '$_', known arguments are include_plugins, exclude_plugins"
             unless /\A(include_plugins|exclude_plugins)\z/;
     }
+    if (!defined($args{include_plugins}) && !defined($args{exclude_plugins})
+        && defined $ENV{URI_INFO_PLUGINS} && length $ENV{URI_INFO_PLUGINS}) {
+        $args{include_plugins} = undef;
+        $args{exclude_plugins} = [];
+        my @elems = split /\s*,\s*/, $ENV{URI_INFO_PLUGINS};
+        my ($exclude_sign, $plugin, $args);
+        $args = [];
+        while (@elems) {
+            my $elem = shift @elems;
+            if ($elem =~ /\A([+-])(.+)/) {
+                if (defined $plugin) {
+                    # add previous plugin
+                    my $key = $exclude_sign eq '-' ? 'exclude_plugins' : 'include_plugins';
+                    $args{$key} //= [];
+                    push @{$args{$key}}, $plugin . (@$args ? "=".join(",", @$args) : "");
+                }
+                ($exclude_sign, $plugin) = ($1, $2);
+            } else {
+                push @$args, $elem;
+            }
+        }
+        # add last plugin
+        die "[URI::Info] Invalid syntax in URI_INFO_PLUGINS variable: no plugins specified, only args"
+            unless defined $plugin;
+        my $key = $exclude_sign eq '-' ? 'exclude_plugins' : 'include_plugins';
+        $args{$key} //= [];
+        push @{$args{$key}}, $plugin . (@$args ? "=".join(",", @$args) : "");
+    }
+
+    unless (defined $args{include_plugins}) {
+        require Module::List::Wildcard;
+        my $mods = Module::List::Wildcard::list_modules($p, {list_modules=>1, recurse=>1});
+        $args{include_plugins} = [map {my $mod=$_; $mod=~s/\A\Q$p\E//; $mod} sort keys %$mods];
+    }
+
     my $self = bless \%args, $class;
 
+    $self->{plugin_objs_by_host} = {}; # key=host, value=[plugin_obj1, ...]
+
     $self->_load_plugins;
-    $self->_init;
     $self;
 }
 
-my $p = "URI::Info::Plugin::";
 sub _load_plugins {
     require Module::List::Wildcard;
     require Module::Path::More;
@@ -61,6 +97,9 @@ sub _load_plugins {
         if (ref $entry eq 'ARRAY') {
             $prefix = $entry->[0];
             $args = $entry->[1];
+        } elsif ($entry =~ /\A(\w+(?:::\w+)*)=(.*)\z/) {
+            $prefix = $1;
+            $args = [split /\s*,\s*/, $2];
         } else {
             $prefix = $entry;
             $args = {};
@@ -77,15 +116,12 @@ sub _load_plugins {
                     log_debug "[URI::Info] plugin '$_' is excluded (matches $prefix)";
                     next;
                 }
+                log_debug "[URI::Info] Loading plugin module $mod ...";
                 (my $mod_pm = "$mod.pm") =~ s!::!/!g;
                 require $mod_pm;
                 $self->_activate_plugin($mod, $args);
             }
         } else {
-            my ($host, $event, $prio);
-            $prefix =~ s/\@(\d+)?\z// and $prio = $1 if defined $1;
-            $prefix =~ s/\@(\w+)\z// and $event = $1 if defined $1;
-            $prefix =~ s/\@([^@]+)?\z// and $host = $1 if defined $1;
             my $mod = "${p}$prefix";
             my $path = Module::Path::More::module_path(module=>$mod);
             if ($path) {
@@ -93,9 +129,10 @@ sub _load_plugins {
                     log_debug "[URI::Info] plugin '$_' is excluded";
                     next;
                 }
+                log_debug "[URI::Info] Loading plugin module $mod ...";
                 (my $mod_pm = "$mod.pm") =~ s!::!/!g;
                 require $mod_pm;
-                $self->_activate_plugin($mod, $args, $host, $event, $prio);
+                $self->_activate_plugin($mod, $args);
             } else {
                 die "[URI::Info] plugin '$_' cannot be found";
             }
@@ -103,268 +140,68 @@ sub _load_plugins {
     }
 }
 
-sub _add_handler {
-    my ($self, $host, $event, $label, $prio, $handler) = @_;
-
-    $self->{handlers_seq} //= 0;
-    my $handlers;
-    my $filter;
-    if ($host && !ref($host)) {
-        $self->{handlers}{$host}{$event} //= [];
-        $handlers = $self->{handlers}{$host}{$event};
-    } else {
-        if ($host) {
-            if (ref $host eq 'Regexp') {
-                $filter = sub {
-                    my ($input_host) = @_;
-                    $input_host =~ $host;
-                };
-            } elsif (ref $host eq 'CODE') {
-                $filter = $host;
-            } else {
-                die "Unknown type for 'host', please use str/regex/code: $host";
-            }
-        }
-        $self->{handlers}{''}{$event} //= [];
-        $handlers = $self->{handlers}{''}{$event};
-    }
-
-    # keep sorted
-    splice @$handlers, 0, scalar(@$handlers),
-        (sort { $a->[1] <=> $b->[1] || $a->[4] <=> $b->[4] } @$handlers,
-         [$label,                  #0 = label
-          $prio,                   #1 = prio
-          $filter,                 #2 = filter
-          $handler,                #3 = handler code
-          $self->{handlers_seq}++, #4 = insert sequence, for sorting
-      ]);
-}
-
+# this will install plugins by host
 sub _activate_plugin {
-    my ($self, $mod, $args, $wanted_host, $wanted_event, $wanted_prio) = @_;
+    my ($self, $mod, $args) = @_;
 
     # module must already be loaded at this point
 
     # instantiate plugin object
-    my $obj = $mod->new(%{$args // {}});
-    my $plugin_meta = $obj->meta;
-    my $host = $plugin_meta->{host};
+    my $plugin_obj  = $mod->new(
+        ref $args eq 'HASH' ? %$args : @{$args // []});
+    my $plugin_meta = $plugin_obj->meta;
+    my $plugin_host0 = $plugin_meta->{host};
 
-    # find all methods in plugin class (note that inherited methods are not
-    # supported atm) and register it as handler
-    my $symtbl = \%{$mod . "::"};
-    for my $k (keys %$symtbl) {
-        my $v = $symtbl->{$k};
-        next unless ref $v eq 'CODE' || defined *$v{CODE};
-        next unless $k =~ /^(before_|on_|after_)(.+)$/;
-
-        my $meth_meta_method = "meta_$k";
-        my $meth_meta = $self->can($meth_meta_method) ? $self->$meth_meta_method : {};
-
-        (my $event = $k) =~ s/^on_//;
-
-        $self->_add_handler(
-            $event =~ /^host_/ ? ($wanted_host // $host) : undef,
-            defined $wanted_event ? $wanted_event : $event,
-            $args->{_name} // $mod,
-            defined $wanted_prio ? $wanted_prio :
-                (defined $meth_meta->{prio} ? $meth_meta->{prio} : 50),
-            sub {
-                my $stash = shift;
-                $obj->$k($stash);
-            },
-        );
-    } # for method
-}
-
-sub _run_event {
-    my ($self, %args) = @_;
-
-    my $name = $args{name};
-    {
-        local $args{code} = '...';
-        local $args{r} = '...';
-        log_trace "[URI::Info] -> run_event(%s)", \%args;
-    }
-    defined $name or die "Please supply 'name'";
-
-    my $before_name = "before_$name";
-    my $after_name = "after_$name";
-
-    my @host_parts;
-    my @handlers;
-    if ($self->{r}{url}) {
-        my $host = $self->{r}{url}->host;
-        @host_parts = ($host);
-        while ($host =~ s/[^.]+(\.|\z)//) { push @host_parts,$host }
+    my @plugin_hosts;
+    if (ref $plugin_host0 eq 'ARRAY') {
+        @plugin_hosts = @$plugin_host0;
+    } elsif (ref $plugin_host0 eq 'CODE') {
+        @plugin_hosts = $plugin_host0->();
+    } elsif (!ref($plugin_host0)) {
+        @plugin_hosts = ($plugin_host0);
     } else {
-        @host_parts = ('');
-    }
-    for my $hp (@host_parts) {
-        next unless $self->{handlers}{$hp};
-        $self->{handlers}{$hp}{$name} //= [];
-        $self->{handlers}{$hp}{$before_name} //= [];
-        $self->{handlers}{$hp}{$after_name} //= [];
-        push @handlers, $self->{handlers}{$hp};
+        die "[URI::Info] invalid plugin host '$plugin_host0', must be array/code/scalar";
     }
 
-    my $req_handler                          = $args{req_handler};                          $req_handler                          = 0 unless defined $req_handler;
-    my $run_all_handlers                     = $args{run_all_handlers};                     $run_all_handlers                     = 1 unless defined $run_all_handlers;
-    my $allow_before_handler_to_cancel_event = $args{allow_before_handler_to_cancel_event}; $allow_before_handler_to_cancel_event = 1 unless defined $allow_before_handler_to_cancel_event;
-    my $allow_before_handler_to_skip_rest    = $args{allow_before_handler_to_skip_rest};    $allow_before_handler_to_skip_rest    = 1 unless defined $allow_before_handler_to_skip_rest;
-    my $allow_handler_to_skip_rest           = $args{allow_handler_to_skip_rest};           $allow_handler_to_skip_rest           = 1 unless defined $allow_handler_to_skip_rest;
-    my $allow_handler_to_repeat_event        = $args{allow_handler_to_repeat_event};        $allow_handler_to_repeat_event        = 1 unless defined $allow_handler_to_repeat_event;
-    my $allow_after_handler_to_repeat_event  = $args{allow_after_handler_to_repeat_event};  $allow_after_handler_to_repeat_event  = 1 unless defined $allow_after_handler_to_repeat_event;
-    my $allow_after_handler_to_skip_rest     = $args{allow_after_handler_to_skip_rest};     $allow_after_handler_to_skip_rest     = 1 unless defined $allow_after_handler_to_skip_rest;
-    my $stop_after_first_handler_failure     = $args{stop_after_first_handler_failure};     $stop_after_first_handler_failure     = 1 unless defined $stop_after_first_handler_failure;
-
-    my ($res, $is_success);
-
-  RUN_BEFORE_EVENT_HANDLERS:
-    {
-        last if $name =~ /\A(after|before)_/;
-        local $self->{r}{event} = $before_name;
-        my $i = 0;
-        for my $rec (@{ $Handlers{$before_name} }) {
-            $i++;
-            my ($label, $prio, $filter, $handler) = @$rec;
-            log_trace "[URI::Info] [event %s] [%d/%d] -> handler %s ...",
-                $before_name, $i, scalar(@{ $Handlers{$before_name} }), $label;
-            $res = $handler->($r);
-            $is_success = $res->[0] =~ /\A[123]/;
-            log_trace "[URI::Info] [event %s] [%d/%d] <- handler %s: %s (%s)",
-                $before_name, $i, scalar(@{ $Handlers{$before_name} }), $label,
-                $res, $is_success ? "success" : "fail";
-            if ($res->[0] == 601) {
-                if ($allow_before_handler_to_cancel_event) {
-                    log_trace "[pericmd] Cancelling event $name (status 601)";
-                    goto RETURN;
-                } else {
-                    die "$before_name handler returns 601 when allow_before_handler_to_cancel_event is set to false";
-                }
-            }
-            if ($res->[0] == 201) {
-                if ($allow_before_handler_to_skip_rest) {
-                    log_trace "[pericmd] Skipping the rest of the $before_name handlers (status 201)";
-                    last RUN_BEFORE_EVENT_HANDLERS;
-                } else {
-                    log_trace "[pericmd] $before_name handler returns 201, but we ignore it because allow_before_handler_to_skip_rest is set to false";
-                }
-            }
-        }
+    for my $plugin_host (@plugin_hosts) {
+        $self->{plugin_objs_by_host}{$plugin_host} //= [];
+        push @{ $self->{plugin_objs_by_host}{$plugin_host} }, $plugin_obj;
     }
-
-  RUN_EVENT_HANDLERS:
-    {
-        local $r->{event} = $name;
-        my $i = 0;
-        $res = [304, "There is no handler for event $name"];
-        $is_success = 1;
-        if ($req_handler) {
-            die "There is no handler for event $name"
-                unless @{ $Handlers{$name} };
-        }
-
-        for my $rec (@{ $Handlers{$name} }) {
-            $i++;
-            my ($label, $prio, $handler) = @$rec;
-            log_trace "[pericmd] [event %s] [%d/%d] -> handler %s ...",
-                $name, $i, scalar(@{ $Handlers{$name} }), $label;
-            $res = $handler->($r);
-            $is_success = $res->[0] =~ /\A[123]/;
-            log_trace "[pericmd] [event %s] [%d/%d] <- handler %s: %s (%s)",
-                $name, $i, scalar(@{ $Handlers{$name} }), $label,
-                $res, $is_success ? "success" : "fail";
-            last RUN_EVENT_HANDLERS if $is_success && !$run_all_handlers;
-            if ($res->[0] == 601) {
-                die "$name handler is not allowed to return 601";
-            }
-            if ($res->[0] == 602) {
-                if ($allow_handler_to_repeat_event) {
-                    log_trace "[pericmd] Repeating event $name (handler returns 602)";
-                    goto RUN_EVENT_HANDLERS;
-                } else {
-                    die "$name handler returns 602 when allow_handler_to_repeat_event is set to false";
-                }
-            }
-            if ($res->[0] == 201) {
-                if ($allow_handler_to_skip_rest) {
-                    log_trace "[pericmd] Skipping the rest of the $name handlers (status 201)";
-                    last RUN_EVENT_HANDLERS;
-                } else {
-                    log_trace "[pericmd] $name handler returns 201, but we ignore it because allow_handler_to_skip_rest is set to false";
-                }
-            }
-            last RUN_EVENT_HANDLERS if !$is_success && $stop_after_first_handler_failure;
-        }
-    }
-
-    if ($is_success && $args{on_success}) {
-        log_trace "[pericmd] Running on_success ...";
-        $args{on_success}->($r);
-    } elsif (!$is_success && $args{on_failure}) {
-        log_trace "[pericmd] Running on_failure ...";
-        $args{on_failure}->($r);
-    }
-
-  RUN_AFTER_EVENT_HANDLERS:
-    {
-        last if $name =~ /\A(after|before)_/;
-        local $r->{event} = $after_name;
-        my $i = 0;
-        for my $rec (@{ $Handlers{$after_name} }) {
-            $i++;
-            my ($label, $prio, $handler) = @$rec;
-            log_trace "[pericmd] [event %s] [%d/%d] -> handler %s ...",
-                $after_name, $i, scalar(@{ $Handlers{$after_name} }), $label;
-            $res = $handler->($r);
-            $is_success = $res->[0] =~ /\A[123]/;
-            log_trace "[pericmd] [event %s] [%d/%d] <- handler %s: %s (%s)",
-                $after_name, $i, scalar(@{ $Handlers{$after_name} }), $label,
-                $res, $is_success ? "success" : "fail";
-            if ($res->[0] == 602) {
-                if ($allow_after_handler_to_repeat_event) {
-                    log_trace "[pericmd] Repeating event $name (status 602)";
-                    goto RUN_EVENT_HANDLERS;
-                } else {
-                    die "$after_name handler returns 602 when allow_after_handler_to_repeat_event it set to false";
-                }
-            }
-            if ($res->[0] == 201) {
-                if ($allow_after_handler_to_skip_rest) {
-                    log_trace "[pericmd] Skipping the rest of the $after_name handlers (status 201)";
-                    last RUN_AFTER_EVENT_HANDLERS;
-                } else {
-                    log_trace "[pericmd] $after_name handler returns 201, but we ignore it because allow_after_handler_to_skip_rest is set to false";
-                }
-            }
-        }
-    }
-
-  RETURN:
-    log_trace "[pericmd] <- run_event(name=%s)", $name;
-    undef;
 }
 
-my $handler_seq = 0;
-sub __plugin_add_handler {
-    my ($event, $label, $prio, $handler) = @_;
+sub _call_plugins {
+    my ($self, $meth, $stash) = @_;
 
-    # XXX check for known events?
-    $Handlers{$event} ||= [];
-
-    # keep sorted
-    splice @{ $Handlers{$event} }, 0, scalar(@{ $Handlers{$event} }),
-        (sort { $a->[1] <=> $b->[1] || $a->[3] <=> $b->[3] } @{ $Handlers{$event} },
-         [$label, $prio, $handler, $handler_seq++]);
+    my $host0 = $stash->{url}->host;
+    my @hosts;
+    push @hosts, $host0;
+    while ($host0 =~ s/\A[\w-]+(?:\.|\z)//) {
+        push @hosts, $host0;
+    }
+    for my $host (@hosts) {
+        my $plugin_objs = $self->{plugin_objs_by_host}{$host};
+        next unless $plugin_objs;
+        for my $plugin_obj (@$plugin_objs) {
+            log_trace "[URI::Info] Calling plugin %s %s", ref($plugin_obj), $meth;
+            $plugin_obj->$meth($stash);
+            # XXX currently ignore return value
+        }
+    }
 }
 
 sub info {
-    my $self = shift;
-    my $url = shift;
+    require URI::URL;
+    require URI::QueryParam;
 
-    for my $plugin (@{ $self->{loaded_plugin} }) {
-    }
+    my ($self, $url) = @_;
+    my $stash = {
+        url => URI::URL->new($url),
+        res => {
+            url => $url,
+        },
+    };
+    $self->_call_plugins('get_info', $stash);
+    $stash->{res};
 }
 
 sub uri_info {
@@ -407,7 +244,7 @@ Keywords: URI parser, URL parser, search string extractor
 
 Usage:
 
- my $obj = URI::Info->new(%args);
+ my $uinfo = URI::Info->new(%args);
 
 Constructor. Known arguments (C<*> marks required arguments):
 
@@ -416,20 +253,30 @@ Constructor. Known arguments (C<*> marks required arguments):
 =item * include_plugins
 
 Array of plugins (names or wildcard patterns or names+arguments) to include.
-Plugin name is module name under C<URI::Info::Plugin::> without the prefix, e.g.
-C<SearchQuery::tokopedia> with optional host name
-(C<SearchQuery::tokopedia@foo.com>), event name (e.g.
-C<Debug::DumpStash@@before_get_info>), and priority (e.g.
-C<Debug::DumpStash@@before_get_info@99>). Wildcard pattern is a pattern
-containing wildcard characters, e.g C<SearchQuery::toko*> or C<SearchQuery::**>
-(see L<Module::List::Wildcard> for more details on the wildcard). You cannot
-special optional host name, event name, or priority when using wildcard pattern.
-name+argument is a 2-array arrayref where the first element is plugin name or
-wildcard pattern, and the second element is hashref of arguments to instantiate
-the plugin with, e.g. C<< ['SearchQuery::tokopedia', {foo=>1, bar=>2, ...}] >>.
+Plugin name is module name under C<URI::Info::Plugin::> without the prefix,
+e.g.:
 
-If unspecified, will list all installed modules under C<URI::Info::Plugin::> and
-include them all.
+ SearchQuery::tokopedia
+
+Wildcard pattern is a pattern containing wildcard characters, e.g:
+
+ SearchQuery::toko*
+ SearchQuery::**
+
+See L<Module::List::Wildcard> for more details on the wildcard behavior,
+particularly the difference between C<*> and C<**>.
+
+Name+argument is either: 1) a string containing plugin name followed by C<=>
+followed by a comma-separated list of arguments, or; 2) a 2-element arrayref
+where the first element is plugin name or wildcard pattern, and the second
+element is an arrayref or hashref of arguments to instantiate the plugin with.
+Examples:
+
+ SearchQuery::tokopedia=foo,1,bar,2
+ ['SearchQuery::tokopedia', {foo=>1, bar=>2, ...}]
+
+If C<include_plugins> is unspecified, will list all installed modules under
+C<URI::Info::Plugin::> and include them all.
 
 =item * exclude_plugins
 
@@ -440,6 +287,17 @@ Takes precedence over C<include_plugins> argument.
 Default is empty array.
 
 =back
+
+=head2 info
+
+Usage:
+
+ my $hashref = $uinfo->info($url);
+
+Example:
+
+ my $hashref = $uinfo->info("https://www.google.com/search?q=foo+bar");
+ # => {url=>"https://www.google.com/search?q=foo+bar", is_search=>1, search_type=>'search', search_query=>'foo bar'}
 
 
 =head1 FUNCTIONS
@@ -457,10 +315,12 @@ To customize the set of plugins to use, use the OO interface.
 
 =head1 ENVIRONMENT
 
-Planned: URI::Info will read C<URI_INFO_PLUGINS> to include/exclude plugins,
-with this syntax:
+=head2 URI_INFO_PLUGINS
 
- -Plugin1ToExclude,+Plugin2ToInclude,arg1,val1,...,+Plugin3ToInclude@Host@EventName@Priority,...
+This can be used to include/exclude plugins when C<include_plugins> *and*
+C<exclude_plugins> attributes are not set. The syntax is:
+
+ -Plugin1ToExclude,+Plugin2ToInclude,arg1,val1,...,+Plugin3ToInclude
 
 
 =head1 SEE ALSO

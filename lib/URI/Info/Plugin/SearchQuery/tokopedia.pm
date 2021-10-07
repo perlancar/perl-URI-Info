@@ -19,16 +19,17 @@ sub meta {
     };
 }
 
-sub host_get_info {
+sub get_info {
     my ($self, $stash) = @_;
     my $url = $stash->{url};
+    my $res = $stash->{res};
+
     if ($url->full_path =~ m!\A/search!) {
-        return [200, "OK", {
-            search_type  => $url->query_param('st'),
-            search_query => $url->query_param('q'),
-        }];
+        $res->{is_search} = 1;
+        $res->{search_type} = $url->query_param('st');
+        $res->{search_query} = $url->query_param('q');
     }
-    [100];
+    [200]; # 200=OK, 201=OK & skip the rest of the plugins, 500=error
 }
 
 1;
