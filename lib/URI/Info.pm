@@ -126,7 +126,7 @@ sub _load_plugins {
             my $path = Module::Path::More::module_path(module=>$mod);
             if ($path) {
                 if ($exclude_plugins{$prefix}) {
-                    log_debug "[URI::Info] plugin '$_' is excluded";
+                    log_debug "[URI::Info] plugin '$mod' is excluded";
                     next;
                 }
                 log_debug "[URI::Info] Loading plugin module $mod ...";
@@ -134,7 +134,7 @@ sub _load_plugins {
                 require $mod_pm;
                 $self->_activate_plugin($mod, $args);
             } else {
-                die "[URI::Info] plugin '$_' cannot be found";
+                die "[URI::Info] plugin '$mod' cannot be found";
             }
         }
     }
