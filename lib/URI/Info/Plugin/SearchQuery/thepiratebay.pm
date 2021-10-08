@@ -37,3 +37,5 @@ sub get_info {
 
 1;
 # ABSTRACT:
+
+=for Pod::Coverage .+

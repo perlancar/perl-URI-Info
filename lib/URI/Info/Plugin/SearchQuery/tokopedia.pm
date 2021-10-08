@@ -1,14 +1,14 @@
 package URI::Info::Plugin::SearchQuery::tokopedia;
 
-# AUTHORITY
-# DATE
-# DIST
-# VERSION
-
 use strict;
 use warnings;
 
 use parent 'URI::Info::PluginBase';
+
+# AUTHORITY
+# DATE
+# DIST
+# VERSION
 
 sub meta {
     return {
@@ -34,3 +34,5 @@ sub get_info {
 
 1;
 # ABSTRACT:
+
+=for Pod::Coverage .+

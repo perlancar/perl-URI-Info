@@ -325,6 +325,7 @@ C<exclude_plugins> attributes are not set. The syntax is:
 
 =head1 SEE ALSO
 
-L<URI::ParseSearchString>
+L<URI::ParseSearchString>. For extracting search query terms, this module is
+much more concise albeit not plugin-based. Last update is 2011.
 
 =cut

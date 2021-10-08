@@ -24,3 +24,5 @@ sub new {
 
 1;
 # ABSTRACT: Base class for URI::Info::Plugin::*
+
+=for Pod::Coverage .+
