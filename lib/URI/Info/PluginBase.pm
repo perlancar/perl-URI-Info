@@ -1,12 +1,12 @@
 package URI::Info::PluginBase;
 
+use strict;
+use warnings;
+
 # AUTHORITY
 # DATE
 # DIST
 # VERSION
-
-use strict;
-use warnings;
 
 sub new {
     my ($class, %args) = @_;
