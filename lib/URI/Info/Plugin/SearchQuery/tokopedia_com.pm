@@ -1,4 +1,4 @@
-package URI::Info::Plugin::SearchQuery::bukalapak;
+package URI::Info::Plugin::SearchQuery::tokopedia_com;
 
 use strict;
 use warnings;
@@ -12,10 +12,10 @@ use parent 'URI::Info::PluginBase';
 
 sub meta {
     return {
-        summary => 'Extract search query from bukalapak.com URL',
+        summary => 'Extract search query from tokopedia.com URL',
         conf => {
         },
-        host => 'bukalapak.com',
+        host => 'tokopedia.com',
     };
 }
 
@@ -24,10 +24,10 @@ sub get_info {
     my $url = $stash->{url};
     my $res = $stash->{res};
 
-    if ($url->full_path =~ m!\A/products!) {
+    if ($url->full_path =~ m!\A/search!) {
         $res->{is_search} = 1;
-        $res->{search_type} = 'product';
-        $res->{search_query} = $url->query_param('search[keywords]');
+        $res->{search_type} = $url->query_param('st');
+        $res->{search_query} = $url->query_param('q');
     }
     [200]; # 200=OK, 201=OK & skip the rest of the plugins, 500=error
 }
